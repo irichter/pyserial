@@ -34,6 +34,7 @@ import fcntl
 import os
 import platform
 import select
+from selectors import EVENT_READ, EVENT_WRITE, DefaultSelector
 import struct
 import sys
 import termios
@@ -567,45 +568,49 @@ class Serial(SerialBase, PlatformSpecific):
             raise PortNotOpenError()
         read = bytearray()
         timeout = Timeout(self._timeout)
-        while len(read) < size:
-            try:
-                ready, _, _ = select.select([self.fd, self.pipe_abort_read_r], [], [], timeout.time_left())
-                if self.pipe_abort_read_r in ready:
-                    os.read(self.pipe_abort_read_r, 1000)
-                    break
-                # If select was used with a timeout, and the timeout occurs, it
-                # returns with empty lists -> thus abort read operation.
-                # For timeout == 0 (non-blocking operation) also abort when
-                # there is nothing to read.
-                if not ready:
-                    break   # timeout
-                buf = os.read(self.fd, size - len(read))
-            except OSError as e:
-                # this is for Python 3.x where select.error is a subclass of
-                # OSError ignore BlockingIOErrors and EINTR. other errors are shown
-                # https://www.python.org/dev/peps/pep-0475.
-                if e.errno not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
-                    raise SerialException('read failed: {}'.format(e))
-            except select.error as e:
-                # this is for Python 2.x
-                # ignore BlockingIOErrors and EINTR. all errors are shown
-                # see also http://www.python.org/dev/peps/pep-3151/#select
-                if e[0] not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
-                    raise SerialException('read failed: {}'.format(e))
-            else:
-                # read should always return some data as select reported it was
-                # ready to read when we get to this point.
-                if not buf:
-                    # Disconnected devices, at least on Linux, show the
-                    # behavior that they are always ready to read immediately
-                    # but reading returns nothing.
-                    raise SerialException(
-                        'device reports readiness to read but returned no data '
-                        '(device disconnected or multiple access on port?)')
-                read.extend(buf)
+        with DefaultSelector() as selector:
+            selector.register(self.fd, EVENT_READ, self.fd)
+            selector.register(self.pipe_abort_read_r, EVENT_READ, self.pipe_abort_read_r)
+            while len(read) < size:
+                try:
+                    events = selector.select(timeout.time_left())
+                    ready = [x[0].data for x in events]
+                    if self.pipe_abort_read_r in ready:
+                        os.read(self.pipe_abort_read_r, 1000)
+                        break
+                    # If select was used with a timeout, and the timeout occurs, it
+                    # returns with empty lists -> thus abort read operation.
+                    # For timeout == 0 (non-blocking operation) also abort when
+                    # there is nothing to read.
+                    if not ready:
+                        break   # timeout
+                    buf = os.read(self.fd, size - len(read))
+                except OSError as e:
+                    # this is for Python 3.x where select.error is a subclass of
+                    # OSError ignore BlockingIOErrors and EINTR. other errors are shown
+                    # https://www.python.org/dev/peps/pep-0475.
+                    if e.errno not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
+                        raise SerialException('read failed: {}'.format(e))
+                except select.error as e:
+                    # this is for Python 2.x
+                    # ignore BlockingIOErrors and EINTR. all errors are shown
+                    # see also http://www.python.org/dev/peps/pep-3151/#select
+                    if e[0] not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
+                        raise SerialException('read failed: {}'.format(e))
+                else:
+                    # read should always return some data as select reported it was
+                    # ready to read when we get to this point.
+                    if not buf:
+                        # Disconnected devices, at least on Linux, show the
+                        # behavior that they are always ready to read immediately
+                        # but reading returns nothing.
+                        raise SerialException(
+                            'device reports readiness to read but returned no data '
+                            '(device disconnected or multiple access on port?)')
+                    read.extend(buf)
 
-            if timeout.expired():
-                break
+                if timeout.expired():
+                    break
         return bytes(read)
 
     def cancel_read(self):
@@ -623,51 +628,58 @@ class Serial(SerialBase, PlatformSpecific):
         d = to_bytes(data)
         tx_len = length = len(d)
         timeout = Timeout(self._write_timeout)
-        while tx_len > 0:
-            try:
-                n = os.write(self.fd, d)
-                if timeout.is_non_blocking:
-                    # Zero timeout indicates non-blocking - simply return the
-                    # number of bytes of data actually written
-                    return n
-                elif not timeout.is_infinite:
-                    # when timeout is set, use select to wait for being ready
-                    # with the time left as timeout
-                    if timeout.expired():
-                        raise SerialTimeoutException('Write timeout')
-                    abort, ready, _ = select.select([self.pipe_abort_write_r], [self.fd], [], timeout.time_left())
-                    if abort:
-                        os.read(self.pipe_abort_write_r, 1000)
-                        break
-                    if not ready:
-                        raise SerialTimeoutException('Write timeout')
-                else:
-                    assert timeout.time_left() is None
-                    # wait for write operation
-                    abort, ready, _ = select.select([self.pipe_abort_write_r], [self.fd], [], None)
-                    if abort:
-                        os.read(self.pipe_abort_write_r, 1)
-                        break
-                    if not ready:
-                        raise SerialException('write failed (select)')
-                d = d[n:]
-                tx_len -= n
-            except SerialException:
-                raise
-            except OSError as e:
-                # this is for Python 3.x where select.error is a subclass of
-                # OSError ignore BlockingIOErrors and EINTR. other errors are shown
-                # https://www.python.org/dev/peps/pep-0475.
-                if e.errno not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
-                    raise SerialException('write failed: {}'.format(e))
-            except select.error as e:
-                # this is for Python 2.x
-                # ignore BlockingIOErrors and EINTR. all errors are shown
-                # see also http://www.python.org/dev/peps/pep-3151/#select
-                if e[0] not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
-                    raise SerialException('write failed: {}'.format(e))
-            if not timeout.is_non_blocking and timeout.expired():
-                raise SerialTimeoutException('Write timeout')
+        with DefaultSelector() as selector:
+            selector.register(self.fd, EVENT_WRITE, self.fd)
+            selector.register(self.pipe_abort_write_r, EVENT_READ, self.pipe_abort_write_r)
+            while tx_len > 0:
+                try:
+                    n = os.write(self.fd, d)
+                    if timeout.is_non_blocking:
+                        # Zero timeout indicates non-blocking - simply return the
+                        # number of bytes of data actually written
+                        return n
+                    elif not timeout.is_infinite:
+                        # when timeout is set, use select to wait for being ready
+                        # with the time left as timeout
+                        if timeout.expired():
+                            raise SerialTimeoutException('Write timeout')
+                        events = selector.select(timeout.time_left())
+                        abort = [x[0].data for x in events if x[0].data in [self.pipe_abort_write_r]]
+                        ready = [x[0].data for x in events if x[0].data in [self.fd]]
+                        if abort:
+                            os.read(self.pipe_abort_write_r, 1000)
+                            break
+                        if not ready:
+                            raise SerialTimeoutException('Write timeout')
+                    else:
+                        assert timeout.time_left() is None
+                        # wait for write operation
+                        events = selector.select()
+                        abort = [x[0].data for x in events if x[0].data in [self.pipe_abort_write_r]]
+                        ready = [x[0].data for x in events if x[0].data in [self.fd]]
+                        if abort:
+                            os.read(self.pipe_abort_write_r, 1)
+                            break
+                        if not ready:
+                            raise SerialException('write failed (select)')
+                    d = d[n:]
+                    tx_len -= n
+                except SerialException:
+                    raise
+                except OSError as e:
+                    # this is for Python 3.x where select.error is a subclass of
+                    # OSError ignore BlockingIOErrors and EINTR. other errors are shown
+                    # https://www.python.org/dev/peps/pep-0475.
+                    if e.errno not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
+                        raise SerialException('write failed: {}'.format(e))
+                except select.error as e:
+                    # this is for Python 2.x
+                    # ignore BlockingIOErrors and EINTR. all errors are shown
+                    # see also http://www.python.org/dev/peps/pep-3151/#select
+                    if e[0] not in (errno.EAGAIN, errno.EALREADY, errno.EWOULDBLOCK, errno.EINPROGRESS, errno.EINTR):
+                        raise SerialException('write failed: {}'.format(e))
+                if not timeout.is_non_blocking and timeout.expired():
+                    raise SerialTimeoutException('Write timeout')
         return length - len(d)
 
     def flush(self):
